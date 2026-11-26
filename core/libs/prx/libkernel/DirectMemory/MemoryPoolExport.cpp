@@ -7,6 +7,7 @@
 #include <mutex>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "DirectMemory.hpp"
 
 namespace {
@@ -27,28 +28,6 @@ PoolState& Pool() {
 
 bool PageAligned(uint64_t v) { return (v & (PS5_PAGE_SIZE - 1)) == 0; }
 
-int PoolCommit(void* addr, uint64_t len, int type, int prot) {
-    if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
-    const int ret = DoMtypeprotect(addr, static_cast<size_t>(len), type, prot);
-    if (ret == 0) {
-        PoolState& pool = Pool();
-        std::lock_guard<std::mutex> lock(pool.mutex);
-        pool.committedBytes += static_cast<size_t>(len);
-    }
-    return ret;
-}
-
-int PoolDecommit(void* addr, uint64_t len) {
-    if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
-    const int ret = DoMprotect(addr, static_cast<size_t>(len), 0);
-    if (ret == 0) {
-        PoolState& pool = Pool();
-        std::lock_guard<std::mutex> lock(pool.mutex);
-        pool.committedBytes -= static_cast<size_t>(len) < pool.committedBytes ? static_cast<size_t>(len) : pool.committedBytes;
-    }
-    return ret;
-}
-
 template <typename TFunction>
 int Guarded(TFunction function) {
     try {
@@ -56,6 +35,34 @@ int Guarded(TFunction function) {
     } catch (const std::exception&) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
+}
+
+int PoolCommit(void* addr, uint64_t len, int type, int prot) {
+    if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
+    RequireProtectTarget(addr, static_cast<size_t>(len), prot);
+    return Guarded([&] {
+        const int ret = DoMtypeprotect(addr, static_cast<size_t>(len), type, prot);
+        if (ret == 0) {
+            PoolState& pool = Pool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            pool.committedBytes += static_cast<size_t>(len);
+        }
+        return ret;
+    });
+}
+
+int PoolDecommit(void* addr, uint64_t len) {
+    if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
+    RequireProtectTarget(addr, static_cast<size_t>(len), 0);
+    return Guarded([&] {
+        const int ret = DoMprotect(addr, static_cast<size_t>(len), 0);
+        if (ret == 0) {
+            PoolState& pool = Pool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            pool.committedBytes -= static_cast<size_t>(len) < pool.committedBytes ? static_cast<size_t>(len) : pool.committedBytes;
+        }
+        return ret;
+    });
 }
 
 }  // namespace
@@ -85,15 +92,25 @@ int APS5_VABI sceKernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entries
     break;
    }
   }
-  ret = Guarded([&] {
-   switch (e.op) {
-    case 1: return PoolCommit(e.commit.addr, e.commit.len, e.commit.type, e.commit.prot);
-    case 2: return PoolDecommit(e.decommit.addr, e.decommit.len);
-    case 3: return DoMprotect(e.protect.addr, static_cast<size_t>(e.protect.len), e.protect.prot & DefinedProtection);
-    case 4: return DoMtypeprotect(e.type_protect.addr, static_cast<size_t>(e.type_protect.len), e.type_protect.type, e.type_protect.prot);
-    default: return SCE_KERNEL_ERROR_EINVAL;
-   }
-  });
+  switch (e.op) {
+   case 1:
+    ret = PoolCommit(e.commit.addr, e.commit.len, e.commit.type, e.commit.prot);
+    break;
+   case 2:
+    ret = PoolDecommit(e.decommit.addr, e.decommit.len);
+    break;
+   case 3:
+    RequireProtectTarget(e.protect.addr, static_cast<size_t>(e.protect.len), e.protect.prot & DefinedProtection);
+    ret = Guarded([&] { return DoMprotect(e.protect.addr, static_cast<size_t>(e.protect.len), e.protect.prot & DefinedProtection); });
+    break;
+   case 4:
+    RequireProtectTarget(e.type_protect.addr, static_cast<size_t>(e.type_protect.len), e.type_protect.prot);
+    ret = Guarded([&] { return DoMtypeprotect(e.type_protect.addr, static_cast<size_t>(e.type_protect.len), e.type_protect.type, e.type_protect.prot); });
+    break;
+   default:
+    ret = SCE_KERNEL_ERROR_EINVAL;
+    break;
+  }
   if (ret != 0) break;
  }
  if (num_entries_out != nullptr) {
@@ -105,12 +122,12 @@ int APS5_VABI sceKernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entries
 
 int APS5_VABI sceKernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
  (void)flags;
- return Guarded([&] { return PoolCommit(addr, len, type, prot); });
+ return PoolCommit(addr, len, type, prot);
 }
 
 int APS5_VABI sceKernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
  (void)flags;
- return Guarded([&] { return PoolDecommit(addr, len); });
+ return PoolDecommit(addr, len);
 }
 
 int APS5_VABI sceKernelMemoryPoolExpand(int64_t search_start, int64_t search_end, size_t len, size_t alignment, int64_t* phys_addr_out) {
@@ -149,8 +166,9 @@ int APS5_VABI sceKernelMemoryPoolReserve(void* addr_in, size_t len, size_t align
  if (!addr_out || len == 0 || !PageAligned(len) || (alignment != 0 && !PageAligned(alignment))) {
   return SCE_KERNEL_ERROR_EINVAL;
  }
- const bool writable = GuestCopyOut_nid_no_patch(addr_out, &addr_in, sizeof(addr_in));
- if (!writable) return SCE_KERNEL_ERROR_EFAULT;
+ constexpr int MapFixed = 0x10;
+ if (addr_in != nullptr && (flags & MapFixed) != 0 && FixedReserveValid(addr_in, len, alignment)) GuestArena::GuestArenaRequireMapperAccess_nid_no_patch(addr_in, len);
+ if (!GuestCopyOut_nid_no_patch(addr_out, &addr_in, sizeof(addr_in))) return SCE_KERNEL_ERROR_EFAULT;
  void* reserved = addr_in;
  const int ret = Guarded([&] { return DoReserveVirtual(&reserved, len, flags, alignment); });
  if (ret != 0) return ret;
